@@ -199,6 +199,47 @@ def _provider_auth(config: EvaluationRunConfig) -> ProviderAuth:
     return ProviderAuth(api_key=config.model_api_key)
 
 
+_RESPONSES_PROVIDERS = frozenset({"openai", "meta"})
+"""Providers whose reasoning comes back as Responses API reasoning items."""
+
+
+def _thinking_blocks(chunks: list[ModelResponseStream]) -> list[dict[str, Any]] | None:
+    """The turn's signed thinking blocks, as the API returned them.
+
+    litellm puts a block's text on its signature entry as well, and its stream
+    builder adds that text a second time, so the text comes from the unsigned
+    entries and the signature entry only fills in a block that had none.
+    """
+    blocks: list[dict[str, Any]] = []
+    text: list[str] = []
+    for chunk in chunks:
+        for choice in chunk.choices:
+            for entry in choice.delta.model_dump().get("thinking_blocks") or []:
+                if entry.get("type") == "redacted_thinking":
+                    blocks.append(entry)
+                elif entry.get("signature"):
+                    blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking": "".join(text) or entry.get("thinking") or "",
+                            "signature": entry["signature"],
+                        }
+                    )
+                    text = []
+                else:
+                    text.append(entry.get("thinking") or "")
+    return blocks or None
+
+
+def _reasoning_items(chunks: list[ModelResponseStream]) -> list[dict[str, Any]] | None:
+    return [
+        item
+        for chunk in chunks
+        for choice in chunk.choices
+        for item in choice.delta.model_dump().get("reasoning_items") or []
+    ] or None
+
+
 @final
 class BuiltinSource:
     """The builtin agent: karotte produces the model's response itself by driving
@@ -281,12 +322,14 @@ class BuiltinSource:
 
             message = Message(**choice.message.model_dump())
             # stream_chunk_builder drops the Responses API's reasoning items.
-            message.reasoning_items = [
-                item
-                for chunk in chunks
-                for item in chunk.choices[0].delta.model_dump().get("reasoning_items")
-                or []
-            ] or None
+            message.reasoning_items = (
+                _reasoning_items(chunks)
+                if self._spec.provider in _RESPONSES_PROVIDERS
+                else None
+            )
+            message.thinking_blocks = (
+                _thinking_blocks(chunks) if self._spec.provider == "anthropic" else None
+            )
 
             for name in self._spec.tool_call_repairs:
                 message.tool_calls = repair_tool_calls(

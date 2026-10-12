@@ -10,10 +10,12 @@ Regenerate after an intentional change with:
 and review the golden diff carefully.
 """
 
+import json
 from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any, final, override
 
+import httpx
 import litellm
 import pytest
 from litellm import CustomStreamWrapper
@@ -31,7 +33,10 @@ from litellm.types.utils import Delta as LiteLlmDelta
 from litellm.types.utils import Function as LiteLlmFunction
 from litellm.utils import get_optional_params
 
-from karotte.agents.builtin_source import BuiltinSource
+from karotte.agents.builtin_source import (
+    BuiltinSource,
+    _thinking_blocks,  # pyright: ignore[reportPrivateUsage]
+)
 from karotte.agents.models import resolve_model
 from karotte.judges.rubric_judge import RubricJudge
 from karotte.model_catalog import CATALOG_MODEL_IDS
@@ -357,45 +362,249 @@ async def _repaired_arguments(model: str, monkeypatch: pytest.MonkeyPatch) -> st
     return tool_calls[0].function.arguments
 
 
-@pytest.mark.asyncio
-async def test_reasoning_is_replayed_on_the_next_turn(
-    monkeypatch: pytest.MonkeyPatch,
+def _stream_chunk(model: str, delta: LiteLlmDelta) -> ModelResponseStream:
+    return ModelResponseStream(
+        id="chatcmpl-golden",
+        created=1735689600,
+        model=model,
+        choices=[StreamingChoices(index=0, delta=delta)],
+    )
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        pytest.param(
+            [
+                {"thinking": "A "},
+                {"thinking": "B"},
+                {"thinking": "A B", "signature": "s1"},
+            ],
+            [("A B", "s1")],
+            id="litellm_repeats_the_text_on_the_signature",
+        ),
+        pytest.param(
+            [
+                {"thinking": "A "},
+                {"thinking": "B"},
+                {"thinking": "", "signature": "s1"},
+            ],
+            [("A B", "s1")],
+            id="signature_entry_without_text",
+        ),
+        pytest.param(
+            [{"thinking": "A B", "signature": "s1"}],
+            [("A B", "s1")],
+            id="whole_block_in_one_entry",
+        ),
+        pytest.param(
+            [{"thinking": "", "signature": "s1"}],
+            [("", "s1")],
+            id="thinking_text_omitted",
+        ),
+        pytest.param(
+            [
+                {"thinking": "A"},
+                {"thinking": "A", "signature": "s1"},
+                {"thinking": "B"},
+                {"thinking": "B", "signature": "s2"},
+            ],
+            [("A", "s1"), ("B", "s2")],
+            id="two_blocks",
+        ),
+        pytest.param([{"thinking": "A"}], [], id="unsigned_text_is_dropped"),
+    ],
+)
+def test_thinking_blocks_are_rebuilt_once(
+    entries: list[dict[str, str]], expected: list[tuple[str, str]]
 ):
-    """Anthropic's signed thinking and the Responses API's reasoning items go
-    back on the next request; stream_chunk_builder alone drops the items."""
-    thinking: list[ChatCompletionThinkingBlock] = [
-        {"type": "thinking", "thinking": "17*23", "signature": "sig"}
+    """The text is kept once whichever way litellm spreads it over the entries."""
+    chunks = [
+        _stream_chunk(
+            "claude-opus-5",
+            LiteLlmDelta(thinking_blocks=[{"type": "thinking", **entry}]),  # pyright: ignore[reportArgumentType]
+        )
+        for entry in entries
     ]
+    assert _thinking_blocks(chunks) == (
+        [
+            {"type": "thinking", "thinking": text, "signature": signature}
+            for text, signature in expected
+        ]
+        or None
+    )
+
+
+def test_redacted_thinking_is_kept_in_order():
+    redacted = {"type": "redacted_thinking", "data": "encrypted"}
+    chunks = [
+        _stream_chunk("claude-opus-5", LiteLlmDelta(thinking_blocks=[blocks]))  # pyright: ignore[reportArgumentType]
+        for blocks in (
+            {"type": "thinking", "thinking": "A"},
+            {"type": "thinking", "thinking": "A", "signature": "s1"},
+            redacted,
+        )
+    ]
+    assert _thinking_blocks(chunks) == [
+        {"type": "thinking", "thinking": "A", "signature": "s1"},
+        redacted,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", MODELS)
+async def test_reasoning_goes_back_only_to_models_that_return_it(
+    model: str, monkeypatch: pytest.MonkeyPatch
+):
+    """Signed thinking and Responses API reasoning items go back on the next
+    request for the providers that return them, and no other model gets them."""
+    monkeypatch.delenv("KAROTTE_PROXY_URL", raising=False)
+    block: ChatCompletionThinkingBlock = {
+        "type": "thinking",
+        "thinking": "17*23",
+        "signature": "sig",
+    }
     item: ChatCompletionReasoningItem = {
         "type": "reasoning",
         "id": "rs_1",
         "encrypted_content": "enc",
     }
-    chunks = _dirty_tool_call_chunks("openai/gpt-6-luna")
-    chunks[0].choices[0].delta = LiteLlmDelta(
-        content="", thinking_blocks=list(thinking)
-    )
+    chunks = [
+        _stream_chunk(
+            model,
+            LiteLlmDelta(thinking_blocks=[{"type": "thinking", "thinking": "17*23"}]),
+        ),
+        _stream_chunk(
+            model,
+            LiteLlmDelta(
+                thinking_blocks=[
+                    {"type": "thinking", "thinking": "", "signature": "sig"}
+                ]
+            ),
+        ),
+        *_dirty_tool_call_chunks(model),
+    ]
     chunks[-1].choices[0].delta = LiteLlmDelta(reasoning_items=[item])
 
     async def scripted_acompletion(**_kwargs: Any) -> _ScriptedStream:
         return _ScriptedStream(chunks)
 
     monkeypatch.setattr("litellm.acompletion", scripted_acompletion)
-    source = BuiltinSource(_config("openai/gpt-6-luna"))
+    source = BuiltinSource(_config(model))
     user = Message(role="user", content="Go.")
     [added] = [
         event
         async for event in source.collect([user], [])
         if isinstance(event, MessageAddedEvent)
     ]
-
     sent_user, sent_assistant = source.get_completion_params([user, added.message], [])[
         "messages"
     ]
-    assert sent_assistant["thinking_blocks"] == thinking
-    assert sent_assistant["reasoning_items"] == [item]
+
+    provider = spec_for(model).provider
+    expected_blocks = [block] if provider == "anthropic" else None
+    expected_items = [item] if provider in ("openai", "meta") else None
+    assert added.message.thinking_blocks == expected_blocks
+    assert added.message.reasoning_items == expected_items
+    assert sent_assistant.get("thinking_blocks") == expected_blocks
+    assert sent_assistant.get("reasoning_items") == expected_items
     assert "thinking_blocks" not in sent_user
     assert "reasoning_items" not in sent_user
+
+
+@pytest.mark.asyncio
+async def test_claude_thinking_survives_litellms_own_stream_parser(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Runs litellm's real Anthropic parser over raw events, so a release that
+    changes how it spreads a block over chunks fails here."""
+    monkeypatch.delenv("KAROTTE_PROXY_URL", raising=False)
+
+    def event(name: str, **data: Any) -> str:
+        return f"event: {name}\ndata: {json.dumps({'type': name, **data})}\n\n"
+
+    def delta(index: int, **fields: Any) -> str:
+        return event("content_block_delta", index=index, delta=fields)
+
+    body = "".join(
+        [
+            event(
+                "message_start",
+                message={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-5-5",
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 5, "output_tokens": 1},
+                },
+            ),
+            event(
+                "content_block_start",
+                index=0,
+                content_block={"type": "thinking", "thinking": ""},
+            ),
+            delta(0, type="thinking_delta", thinking="AAA "),
+            delta(0, type="thinking_delta", thinking="BBB"),
+            delta(0, type="signature_delta", signature="sig-1"),
+            event("content_block_stop", index=0),
+            event(
+                "content_block_start",
+                index=1,
+                content_block={
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "echo",
+                    "input": {},
+                },
+            ),
+            delta(1, type="input_json_delta", partial_json="{}"),
+            event("content_block_stop", index=1),
+            event(
+                "message_delta",
+                delta={"stop_reason": "tool_use", "stop_sequence": None},
+                usage={"output_tokens": 9},
+            ),
+            event("message_stop"),
+        ]
+    ).encode()
+    sent: list[dict[str, Any]] = []
+
+    async def fake_send(
+        _self: httpx.AsyncClient, request: httpx.Request, *_args: Any, **_kwargs: Any
+    ) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        if len(sent) > 1:
+            raise httpx.ConnectError("second request captured", request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+    tool: Any = {
+        "type": "function",
+        "function": {"name": "echo", "parameters": {"type": "object"}},
+    }
+    source = BuiltinSource(_config("claude-sonnet-5-5", reasoning_effort="high"))
+    user = Message(role="user", content="Go.")
+    [added] = [
+        event
+        async for event in source.collect([user], [tool])
+        if isinstance(event, MessageAddedEvent)
+    ]
+    block = {"type": "thinking", "thinking": "AAA BBB", "signature": "sig-1"}
+    assert added.message.thinking_blocks == [block]
+
+    result = Message(role="tool", content="ok", tool_call_id="toolu_1")
+    with pytest.raises(Exception, match="second request captured"):
+        await litellm.acompletion(
+            **source.get_completion_params([user, added.message, result], [tool])
+        )
+    assert sent[1]["messages"][1]["content"][0] == block
 
 
 @pytest.mark.asyncio
