@@ -650,8 +650,8 @@ class TestGetContainerRunCommand:
         )
 
         port = sample_config.websocket_config.port
-        assert "--publish" in command
-        assert f"{port}:{port}" in command
+        publish_index = command.index("--publish")
+        assert command[publish_index + 1] == f"127.0.0.1:{port}:{port}"
 
     def test_dev_mode_mounts_environment_src(
         self, sample_config: EvaluationRunConfig, tmp_path: Path

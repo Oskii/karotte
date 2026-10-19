@@ -361,7 +361,7 @@ def get_container_run_command(
         command.extend(
             [
                 "--publish",
-                f"{run_config.websocket_config.port}:{run_config.websocket_config.port}",
+                f"127.0.0.1:{run_config.websocket_config.port}:{run_config.websocket_config.port}",
             ]
         )
 
