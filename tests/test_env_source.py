@@ -202,6 +202,20 @@ class TestFetch:
         with pytest.raises(SourceError, match="nope"):
             fetch(f"file://{repo}", "nope", "", tmp_path / "cache")
 
+    def test_a_ref_that_looks_like_a_git_option_is_rejected(
+        self, repo: Path, tmp_path: Path
+    ):
+        with patch("karotte.env_source.subprocess.run") as git:
+            with pytest.raises(SourceError, match="cannot start with"):
+                fetch(
+                    f"file://{repo}",
+                    "--upload-pack=helper",
+                    "",
+                    tmp_path / "cache",
+                )
+
+        git.assert_not_called()
+
     def test_leaves_no_partial_checkouts(self, repo: Path, tmp_path: Path):
         cache = tmp_path / "cache"
         with pytest.raises(SourceError):

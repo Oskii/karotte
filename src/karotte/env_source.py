@@ -128,9 +128,22 @@ def _git(cwd: Path | None, *args: str, env: dict[str, str] | None = None) -> str
     return result.stdout.strip()
 
 
+def _git_revision(ref: str | None) -> str:
+    """A branch, tag, or commit. Never a Git option.
+
+    ``git fetch`` parses a token that starts with ``-`` as an option, so a
+    SOURCE ref such as ``--upload-pack=...`` would otherwise be a command.
+    """
+    revision = ref or "HEAD"
+    if revision.startswith("-"):
+        raise SourceError("A Git ref cannot start with '-'.")
+    return revision
+
+
 def fetch(url: str, ref: str | None, subdirectory: str, cache: Path) -> Path:
     """Check out ``ref`` (default: the remote's HEAD) of ``url`` into ``cache``,
     keyed by commit, and return the checkout."""
+    revision = _git_revision(ref)
     repo_cache = cache / re.sub(r"[^A-Za-z0-9._-]+", "_", url).strip("_")
     repo_cache.mkdir(parents=True, exist_ok=True)
     if ref and _COMMIT.fullmatch(ref) and (repo_cache / ref).is_dir():
@@ -148,7 +161,8 @@ def fetch(url: str, ref: str | None, subdirectory: str, cache: Path) -> Path:
             "1",
             "--filter=blob:none",
             "origin",
-            ref or "HEAD",
+            "--",
+            revision,
         )
         commit = _git(tmp, "rev-parse", "FETCH_HEAD^{commit}")
         checkout = repo_cache / commit
