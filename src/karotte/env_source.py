@@ -61,9 +61,11 @@ def _parse_pip_url(url: str) -> GitSource:
     if not at:
         path, ref = parts.path, None
     subdirectory = parse_qs(parts.fragment).get("subdirectory", [""])[0].strip("/")
-    return GitSource(
-        parts._replace(path=path, fragment="").geturl(), ref or None, subdirectory
-    )
+    url = parts._replace(path=path, fragment="").geturl()
+    for value in (url, ref):
+        if value and value.startswith("-"):
+            raise SourceError(f"A Git URL or ref cannot start with '-': {value}")
+    return GitSource(url, ref or None, subdirectory)
 
 
 def _parse_github_url(source: str, path: str) -> GitSource:
@@ -110,6 +112,7 @@ def _remote_refs(url: str) -> set[str]:
         "ls-remote",
         "--heads",
         "--tags",
+        "--",
         url,
         env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
     )
@@ -128,22 +131,9 @@ def _git(cwd: Path | None, *args: str, env: dict[str, str] | None = None) -> str
     return result.stdout.strip()
 
 
-def _git_revision(ref: str | None) -> str:
-    """A branch, tag, or commit. Never a Git option.
-
-    ``git fetch`` parses a token that starts with ``-`` as an option, so a
-    SOURCE ref such as ``--upload-pack=...`` would otherwise be a command.
-    """
-    revision = ref or "HEAD"
-    if revision.startswith("-"):
-        raise SourceError("A Git ref cannot start with '-'.")
-    return revision
-
-
 def fetch(url: str, ref: str | None, subdirectory: str, cache: Path) -> Path:
     """Check out ``ref`` (default: the remote's HEAD) of ``url`` into ``cache``,
     keyed by commit, and return the checkout."""
-    revision = _git_revision(ref)
     repo_cache = cache / re.sub(r"[^A-Za-z0-9._-]+", "_", url).strip("_")
     repo_cache.mkdir(parents=True, exist_ok=True)
     if ref and _COMMIT.fullmatch(ref) and (repo_cache / ref).is_dir():
@@ -152,7 +142,7 @@ def fetch(url: str, ref: str | None, subdirectory: str, cache: Path) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix=".fetch-", dir=repo_cache))
     try:
         _git(tmp, "init", "-q")
-        _git(tmp, "remote", "add", "origin", url)
+        _git(tmp, "remote", "add", "--", "origin", url)
         _git(
             tmp,
             "fetch",
@@ -162,7 +152,7 @@ def fetch(url: str, ref: str | None, subdirectory: str, cache: Path) -> Path:
             "--filter=blob:none",
             "origin",
             "--",
-            revision,
+            ref or "HEAD",
         )
         commit = _git(tmp, "rev-parse", "FETCH_HEAD^{commit}")
         checkout = repo_cache / commit
